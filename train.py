@@ -21,6 +21,7 @@ from utils.train_utils import WarmUpLR, initialize_xavier, progress_bar
 from utils.dataset import SlicerDataset, SlicerDatasetSNR
 from modules.loss import reg_BCELoss
 from modules.resnet import ResNet54Double
+from modules.resnet import CNN
 from modules.dain import DAIN_Layer
 from modules.whiten import CropWhitenNet
 
@@ -60,7 +61,30 @@ sample_rate = 2048
 delta_t = 1. / sample_rate
 delta_f = 1 / 1.25
 
-
+def get_model(model_name, device):
+    """
+    Factory function to create the requested model.
+    
+    Arguments
+    ---------
+    model_name : str
+        Name of the model architecture ('cnn' or 'resnet')
+    device : str
+        Device to place the model on
+        
+    Returns
+    -------
+    model : nn.Module
+        The requested model
+    """
+    if model_name.lower() == 'cnn':
+        print(f'Using CNN architecture')
+        return CNN(detectors=2).to(device)
+    elif model_name.lower() == 'resnet':
+        print(f'Using ResNet54Double architecture')
+        return ResNet54Double(detectors=2).to(device)
+    else:
+        raise ValueError(f"Unknown model: {model_name}. Choose 'cnn' or 'resnet'")
 def main(args):
     output_dir = args.output_dir
 
@@ -78,7 +102,7 @@ def main(args):
 
     train_device = args.train_device
 
-    base_model = ResNet54Double().to(train_device)
+    base_model = get_model(args.model, train_device)
     norm = DAIN_Layer(input_dim=2).to(train_device)
     base_model.apply(initialize_xavier)
 
@@ -243,15 +267,15 @@ def main(args):
         sch.step()
 
         torch.save(net.state_dict(), weights_path)
-        # if (epoch+1) in sch_epochs:
-        #     torch.save(net.state_dict(), os.path.join(output_dir, f'epoch_{epoch + 1}.pt'))
+        if (epoch+1) in sch_epochs:
+            torch.save(net.state_dict(), os.path.join(output_dir, f'epoch_{epoch + 1}.pt'))
 
     # training over, save network
     torch.save(net.state_dict(), weights_path)
 
     # training plots
     fig, axs = pylab.subplots(1, 2, sharex=True, figsize=(10, 5))
-    fig.suptitle('Training loss & acc')
+    fig.suptitle(f'Training loss & acc ({args.model.upper()})')
     axs[0].plot(train_losses, label='train')
     axs[0].plot(val_losses, label='val')
     axs[0].title.set_text('Loss')
@@ -271,6 +295,7 @@ def main(args):
     # save to json for plotting later
     with open(os.path.join(output_dir, 'training_stats.json'), 'w') as f:
         train_dict = {
+            'model': args.model,
             'train_losses': train_losses,
             'val_losses': val_losses,
             'train_accs': train_accs,
@@ -312,6 +337,9 @@ if __name__ == '__main__':
                                      "Also, 'cpu:0', 'cuda:1', etc. (zero-indexed). Default: cpu")
     training_group.add_argument('--num-workers', type=int, default=8,
                                 help="Number of workers to use when loading training data. Default: 8")
+    parser.add_argument('--model', type=str, default='resnet', 
+                    choices=['cnn', 'resnet'],
+                    help="Model architecture to use cnn/resnet...")
 
     args = parser.parse_args()
 
