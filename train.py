@@ -82,7 +82,7 @@ def get_model(model_name, device):
         return CNN(detectors=2).to(device)
     elif model_name.lower() == 'resnet':
         print(f'Using ResNet54Double architecture')
-        return ResNet54Double(detectors=2).to(device)
+        return ResNet54Double().to(device)
     else:
         raise ValueError(f"Unknown model: {model_name}. Choose 'cnn' or 'resnet'")
 def main(args):
