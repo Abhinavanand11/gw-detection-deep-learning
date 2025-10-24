@@ -174,8 +174,6 @@ def main(args):
 
             # Optimizer step on a single batch of training data
             opt.zero_grad()
-            if epoch < n_wrm:
-                wrm.step()
 
             training_output = net(training_samples, training_inj_times)
             training_loss = loss(training_output, training_labels)
@@ -184,6 +182,10 @@ def main(args):
             torch.nn.utils.clip_grad_norm_(net.parameters(), max_norm=args.clip_norm)
             # Make the actual optimizer step and save the batch loss
             opt.step()
+
+            # Warmup step after optimizer step
+            if epoch < n_wrm:
+                wrm.step()
 
             # get predictions & gt to measure accuracy
             _, predicted = training_output.max(1)
