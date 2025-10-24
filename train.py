@@ -267,6 +267,16 @@ def main(args):
         val_accs.append(val_acc)
         logging.info(output_string)
         sch.step()
+        with open(os.path.join(output_dir, f'training_stats_{epoch + 1}.json'), 'w') as f:
+            train_dict = {
+                'model': args.model,
+                'epochs_completed': epoch + 1,  # Track how many epochs finished
+                'train_losses': train_losses,
+                'val_losses': val_losses,
+                'train_accs': train_accs,
+                'val_accs': val_accs
+            }
+            json.dump(train_dict, f, indent=2)
 
         torch.save(net.state_dict(), weights_path)
         if (epoch+1) in sch_epochs:
