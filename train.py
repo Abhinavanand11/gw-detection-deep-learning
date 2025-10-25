@@ -277,10 +277,10 @@ def main(args):
                 'val_accs': val_accs
             }
             json.dump(train_dict, f, indent=2)
-
+        torch.save(net.state_dict(), os.path.join(output_dir, f'epoch_{epoch + 1}.pt'))
         torch.save(net.state_dict(), weights_path)
-        if (epoch+1) in sch_epochs:
-            torch.save(net.state_dict(), os.path.join(output_dir, f'epoch_{epoch + 1}.pt'))
+    
+        
 
     # training over, save network
     torch.save(net.state_dict(), weights_path)
