@@ -27,8 +27,6 @@ from modules.whiten import CropWhitenNet
 
 
 def decode_snr_schedule(sch_str):
-    # .e.g.: '5:1-3,5:1-1.5,5:1-1.25,10:1-1,2:0.8-1.2 means 5 epochs of SNR range (1,3),
-    # followed by 5 epochs of (1, 1.5), then 5 epochs of (1,1.25), etc
     steps = sch_str.split(',')
     epochs = []
     s_ranges = []
@@ -61,6 +59,7 @@ sample_rate = 2048
 delta_t = 1. / sample_rate
 delta_f = 1 / 1.25
 
+
 def get_model(model_name, device):
     """
     Factory function to create the requested model.
@@ -85,6 +84,124 @@ def get_model(model_name, device):
         return ResNet54Double().to(device)
     else:
         raise ValueError(f"Unknown model: {model_name}. Choose 'cnn' or 'resnet'")
+
+
+def save_checkpoint(epoch, net, opt, sch, train_losses, val_losses, 
+                   train_accs, val_accs, output_dir, args):
+    """
+    Save COMPLETE checkpoint including model, optimizer, and scheduler state.
+    This allows perfect resumption of training.
+    """
+    checkpoint = {
+        # Model weights
+        'model_state_dict': net.state_dict(),
+        
+        # *** CRITICAL: Optimizer state (momentum, etc.) ***
+        'optimizer_state_dict': opt.state_dict(),
+        
+        # *** CRITICAL: Scheduler state (current LR) ***
+        'scheduler_state_dict': sch.state_dict(),
+        
+        # Training progress
+        'epoch': epoch,
+        
+        # Training history
+        'train_losses': train_losses,
+        'val_losses': val_losses,
+        'train_accs': train_accs,
+        'val_accs': val_accs,
+        
+        # Model config (for verification)
+        'model_name': args.model,
+        'learning_rate': args.learning_rate,
+    }
+    
+    # Save checkpoint for this specific epoch
+    checkpoint_path = os.path.join(output_dir, f'checkpoint_epoch_{epoch + 1}.pt')
+    torch.save(checkpoint, checkpoint_path)
+    
+    # Also save as "latest" for easy resuming
+    latest_path = os.path.join(output_dir, 'checkpoint_latest.pt')
+    torch.save(checkpoint, latest_path)
+    
+    # Save weights-only for compatibility/inference
+    weights_path = os.path.join(output_dir, f'epoch_{epoch + 1}.pt')
+    torch.save(net.state_dict(), weights_path)
+    
+    print(f'✓ Saved checkpoint: epoch {epoch + 1}, LR={opt.param_groups[0]["lr"]:.2e}')
+    
+    return checkpoint_path
+
+
+def load_checkpoint(checkpoint_path, net, opt, sch, train_device):
+    """
+    Load COMPLETE checkpoint and restore all training state.
+    
+    Returns:
+        start_epoch: Which epoch to start from
+        train_losses, val_losses, train_accs, val_accs: Training history
+    """
+    if not os.path.exists(checkpoint_path):
+        print(f'No checkpoint found at {checkpoint_path}, starting from scratch')
+        return 0, [], [], [], []
+    
+    print(f'Loading checkpoint: {checkpoint_path}')
+    checkpoint = torch.load(checkpoint_path, map_location=train_device)
+    
+    # Check if it's the new format (with optimizer) or old format (weights only)
+    if isinstance(checkpoint, dict) and 'model_state_dict' in checkpoint:
+        # New format: full checkpoint
+        net.load_state_dict(checkpoint['model_state_dict'])
+        opt.load_state_dict(checkpoint['optimizer_state_dict'])
+        sch.load_state_dict(checkpoint['scheduler_state_dict'])
+        
+        start_epoch = checkpoint['epoch'] + 1  # Next epoch to train
+        train_losses = checkpoint.get('train_losses', [])
+        val_losses = checkpoint.get('val_losses', [])
+        train_accs = checkpoint.get('train_accs', [])
+        val_accs = checkpoint.get('val_accs', [])
+        
+        print(f'✓ Resumed from epoch {checkpoint["epoch"]}')
+        if train_accs:
+            print(f'  Last train acc: {train_accs[-1]:.2f}%')
+            print(f'  Last val acc: {val_accs[-1]:.2f}%')
+        print(f'  Current LR: {opt.param_groups[0]["lr"]:.2e}')
+        
+        return start_epoch, train_losses, val_losses, train_accs, val_accs
+    
+    else:
+        # Old format: weights only (your current saved files)
+        print(' Warning: Loading weights-only checkpoint (no optimizer state)')
+        print('  Training will continue but optimizer momentum is lost')
+        net.load_state_dict(checkpoint)
+        
+        # Try to load training stats from JSON
+        checkpoint_dir = os.path.dirname(checkpoint_path)
+        stats_files = [f for f in os.listdir(checkpoint_dir) 
+                      if f.startswith('training_stats_') and f.endswith('.json')]
+        
+        if stats_files:
+            latest_stats = max(stats_files, key=lambda x: int(x.split('_')[2].split('.')[0]))
+            stats_path = os.path.join(checkpoint_dir, latest_stats)
+            
+            with open(stats_path, 'r') as f:
+                stats = json.load(f)
+            
+            start_epoch = stats.get('epochs_completed', 0)
+            train_losses = stats.get('train_losses', [])
+            val_losses = stats.get('val_losses', [])
+            train_accs = stats.get('train_accs', [])
+            val_accs = stats.get('val_accs', [])
+            
+            print(f'  Resuming from epoch {start_epoch}')
+            if train_accs:
+                print(f'  Last train acc: {train_accs[-1]:.2f}%')
+            
+            return start_epoch, train_losses, val_losses, train_accs, val_accs
+    
+    return 0, [], [], [], []
+
+
 def main(args):
     output_dir = args.output_dir
 
@@ -107,10 +224,6 @@ def main(args):
     base_model.apply(initialize_xavier)
 
     net = CropWhitenNet(base_model, norm).to(train_device)
-
-    if args.resume_from is not None:
-        print(f'Loading weights: {args.resume_from}')
-        net.load_state_dict(torch.load(args.resume_from, map_location=train_device))
 
     validation_dataset = SlicerDataset(val_hdf, val_npy, slice_len=int(args.slice_dur * sample_rate),
                                        slice_stride=int(args.slice_stride * sample_rate),
@@ -144,15 +257,24 @@ def main(args):
     n_wrm = args.warmup_epochs
     wrm = WarmUpLR(opt, int(len(train_dl) * n_wrm))
 
-    # train/val loop
+    # Load checkpoint if resuming
+    start_epoch = 0
     train_losses = []
     val_losses = []
     train_accs = []
     val_accs = []
+    
+    if args.resume_from is not None:
+        # This now loads optimizer and scheduler state too!
+        start_epoch, train_losses, val_losses, train_accs, val_accs = load_checkpoint(
+            args.resume_from, net, opt, sch, train_device
+        )
+        # Note: No need to manually advance scheduler, it's loaded from checkpoint!
 
     n_epochs = args.epochs
-    # for epoch in tqdm(range(n_epochs), desc="Optimizing network"):
-    for epoch in range(n_epochs):
+    
+    # train/val loop - starts from start_epoch
+    for epoch in range(start_epoch, n_epochs):
 
         net.train()
         # train losses
@@ -165,6 +287,7 @@ def main(args):
         total_val = 0
         correct_val = 0
 
+        # Use the actual epoch number for SNR schedule
         s_min, s_max = get_snr_by_epoch(sch_epochs, sch_ranges, epoch)
         training_dataset.set_snr_range(s_min, s_max)
 
@@ -183,7 +306,7 @@ def main(args):
             # Make the actual optimizer step and save the batch loss
             opt.step()
 
-            # Warmup step after optimizer step
+            # Warmup step after optimizer step (only if still in warmup period)
             if epoch < n_wrm:
                 wrm.step()
 
@@ -205,14 +328,11 @@ def main(args):
         net.eval()
         with torch.no_grad():
 
-            # error analysis in last epoch
+            # error analysis
             positive_correct = 0
             positive_total = 0
-            positive_corr = []
-
             negative_correct = 0
             negative_total = 0
-            negative_corr = []
 
             val_predictions = []
             val_groundtruth = []
@@ -235,17 +355,8 @@ def main(args):
                 val_acc = 100. * (correct_val / total_val)
                 validation_running_loss += validation_loss.clone().cpu().item()
 
-                # get predictions & gt to measure accuracy
-                _, predicted_val = validation_output.max(1)
-                val_predictions.extend(predicted_val)
-
-                _, gt_val = validation_labels.max(1)
-                val_groundtruth.extend(gt_val.cpu().numpy())
                 pos_idx = gt_val == 0
                 neg_idx = ~pos_idx
-                positive_corr.extend(predicted_val[pos_idx].eq(gt_val[pos_idx]).cpu().numpy())
-                # val_loss.extend(validation_loss[pos_idx].cpu().numpy())
-                negative_corr.extend(predicted_val[neg_idx].eq(gt_val[neg_idx]).cpu().numpy())
                 positive_total += pos_idx.sum()
                 negative_total += neg_idx.sum()
                 positive_correct += predicted_val[pos_idx].eq(gt_val[pos_idx]).sum().item()
@@ -255,7 +366,7 @@ def main(args):
                              f'Validation | Loss {validation_running_loss / validation_batches:.2f} | Acc {val_acc:.2f}'
                              f' (+:{100 * (positive_correct/positive_total):.3f}%,-:{100 * (negative_correct/negative_total):.3f}%)')
 
-        # Print information on the training and validation loss in the current epoch and save current network state
+        # Print information and save
         validation_loss = validation_running_loss / validation_batches
         training_loss = training_running_loss / training_batches
         output_string = '%04i Train Loss: %f | Val Loss: %f || Train Acc: %.3f%% | Val Acc: %.3f%% (+:%.3f%%,-:%.3f%%)' % (
@@ -266,23 +377,37 @@ def main(args):
         train_accs.append(train_acc)
         val_accs.append(val_acc)
         logging.info(output_string)
+        
+        # *** SAVE COMPLETE CHECKPOINT (with optimizer!) ***
+        save_checkpoint(
+            epoch=epoch,
+            net=net,
+            opt=opt,
+            sch=sch,
+            train_losses=train_losses,
+            val_losses=val_losses,
+            train_accs=train_accs,
+            val_accs=val_accs,
+            output_dir=output_dir,
+            args=args
+        )
+        
+        # Step scheduler AFTER saving (so checkpoint has correct state)
         sch.step()
+        
+        # Also save legacy JSON stats for compatibility
         with open(os.path.join(output_dir, f'training_stats_{epoch + 1}.json'), 'w') as f:
             train_dict = {
                 'model': args.model,
-                'epochs_completed': epoch + 1,  # Track how many epochs finished
+                'epochs_completed': epoch + 1,
                 'train_losses': train_losses,
                 'val_losses': val_losses,
                 'train_accs': train_accs,
                 'val_accs': val_accs
             }
             json.dump(train_dict, f, indent=2)
-        torch.save(net.state_dict(), os.path.join(output_dir, f'epoch_{epoch + 1}.pt'))
-        torch.save(net.state_dict(), weights_path)
-    
-        
 
-    # training over, save network
+    # training over, save final network
     torch.save(net.state_dict(), weights_path)
 
     # training plots
@@ -298,13 +423,12 @@ def main(args):
 
     fig.savefig(f'{output_dir}/training_curves.png')
 
-    # Print information on the training and validation loss in the current epoch and save current network state
-    # validation_loss = validation_running_loss / validation_batches
+    # Print final validation accuracy
     positive_acc = 100 * (positive_correct / positive_total)
     negative_acc = 100 * (negative_correct / negative_total)
     print(f'Validation accuracy: {val_acc}% (positive: {positive_acc}%, negative: {negative_acc}%)')
 
-    # save to json for plotting later
+    # save final stats
     with open(os.path.join(output_dir, 'training_stats.json'), 'w') as f:
         train_dict = {
             'model': args.model,
@@ -324,38 +448,23 @@ if __name__ == '__main__':
     parser.add_argument('--verbose', action='store_true', help="Print update messages.")
     parser.add_argument('-o', '--output-dir', type=str, help="Path to the directory where the outputs will be stored.")
     parser.add_argument('--data-dir', type=str, help='Path to the directory where data is stored.')
-    parser.add_argument('--slice-dur', type=float, default=3.25, help='Duration (in s) of original slices, e.g., 3.25.'
-                                                                      'After the PSD is calculated these slices are further cropped to 1s.')
+    parser.add_argument('--slice-dur', type=float, default=3.25, help='Duration (in s) of original slices.')
     parser.add_argument('--slice-stride', type=float, default=2., help='Slice stride.')
 
-    training_group.add_argument('--resume-from', type=str, default=None, help='If set, weights will be loaded from this path and training will resume from these weights.')
-    training_group.add_argument('--learning-rate', type=float, default=5e-5,
-                                help="Learning rate of the optimizer. Default: 0.00005")
-    training_group.add_argument('--lr-milestones', type=str, default='20,50', help='Epochs at which we multiply lr by gamma')
-    training_group.add_argument('--gamma', type=float, default=0.5, help='Rate to multiply learning rate by at milestones.')
-    training_group.add_argument('--epochs', type=int, default=10, help="Number of training epochs. Default: 10")
-    training_group.add_argument('--snr-schedule', type=str, default='5:15-100,5:1-100', help='Formatted string for waveform SNR filtering.'
-                                                                                             'First number is epochs, then the range is separated by -')
-    training_group.add_argument('--batch-size', type=int, default=32,
-                                help="Batch size of the training algorithm. Default: 32")
-    training_group.add_argument('--warmup-epochs', type=float, default=0,
-                                help="If >0, the learning rate will be annealed from 1e-8 to learning rate in warmup_epochs")
-    training_group.add_argument('--clip-norm', type=float, default=100.,
-                                help="Gradient clipping norm to stabilize the training. Default 100.")
-    training_group.add_argument('--p-augment', type=float, default=0.25,
-                                help="Percentage of samples where L1 noise is randomly replaced with different segment.")
-    training_group.add_argument('--train-device', type=str, default='cpu',
-                                help="Device to train the network. Use 'cuda' for the GPU."
-                                     "Also, 'cpu:0', 'cuda:1', etc. (zero-indexed). Default: cpu")
-    training_group.add_argument('--num-workers', type=int, default=8,
-                                help="Number of workers to use when loading training data. Default: 8")
-    parser.add_argument('--model', type=str, default='resnet', 
-                    choices=['cnn', 'resnet'],
-                    help="Model architecture to use cnn/resnet...")
+    training_group.add_argument('--resume-from', type=str, default=None, help='Path to checkpoint to resume from.')
+    training_group.add_argument('--learning-rate', type=float, default=5e-5, help="Learning rate.")
+    training_group.add_argument('--lr-milestones', type=str, default='20,50', help='Epochs for LR decay.')
+    training_group.add_argument('--gamma', type=float, default=0.5, help='LR decay rate.')
+    training_group.add_argument('--epochs', type=int, default=10, help="Total number of training epochs.")
+    training_group.add_argument('--snr-schedule', type=str, default='5:15-100,5:1-100', help='SNR schedule.')
+    training_group.add_argument('--batch-size', type=int, default=32, help="Batch size.")
+    training_group.add_argument('--warmup-epochs', type=float, default=0, help="Warmup epochs.")
+    training_group.add_argument('--clip-norm', type=float, default=100., help="Gradient clipping norm.")
+    training_group.add_argument('--p-augment', type=float, default=0.25, help="Augmentation probability.")
+    training_group.add_argument('--train-device', type=str, default='cpu', help="Training device.")
+    training_group.add_argument('--num-workers', type=int, default=8, help="DataLoader workers.")
+    parser.add_argument('--model', type=str, default='resnet', choices=['cnn', 'resnet'], help="Model architecture.")
 
     args = parser.parse_args()
-
-    # logging.basicConfig(format='%(levelname)s | %(asctime)s: %(message)s', level=logging.INFO,
-    #                     datefmt='%d-%m-%Y %H:%M:%S')
 
     main(args)
