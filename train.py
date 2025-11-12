@@ -42,6 +42,11 @@ def decode_snr_schedule(sch_str):
 
 
 def get_snr_by_epoch(sch_epochs, sch_ranges, epoch):
+    """
+    Get SNR range for a given epoch number.
+    
+    IMPORTANT: epoch should be the ACTUAL epoch number (0-indexed or 1-indexed consistently)
+    """
     print(f'Epoch: {epoch}, schedule: {[(sch_epoch, sch_range) for sch_epoch, sch_range in zip(sch_epochs, sch_ranges)]}')
     index = bisect(sch_epochs, epoch)
     if index >= len(sch_epochs):
@@ -91,6 +96,9 @@ def save_checkpoint(epoch, net, opt, sch, train_losses, val_losses,
     """
     Save COMPLETE checkpoint including model, optimizer, and scheduler state.
     This allows perfect resumption of training.
+    
+    NOTE: This should be called BEFORE scheduler.step() so that when resumed,
+    the scheduler is in the correct state for the next epoch.
     """
     checkpoint = {
         # Model weights
@@ -102,7 +110,7 @@ def save_checkpoint(epoch, net, opt, sch, train_losses, val_losses,
         # *** CRITICAL: Scheduler state (current LR) ***
         'scheduler_state_dict': sch.state_dict(),
         
-        # Training progress
+        # Training progress - this is the COMPLETED epoch number
         'epoch': epoch,
         
         # Training history
@@ -138,7 +146,7 @@ def load_checkpoint(checkpoint_path, net, opt, sch, train_device):
     Load COMPLETE checkpoint and restore all training state.
     
     Returns:
-        start_epoch: Which epoch to start from
+        start_epoch: Which epoch to start from (next epoch to train)
         train_losses, val_losses, train_accs, val_accs: Training history
     """
     if not os.path.exists(checkpoint_path):
@@ -155,13 +163,15 @@ def load_checkpoint(checkpoint_path, net, opt, sch, train_device):
         opt.load_state_dict(checkpoint['optimizer_state_dict'])
         sch.load_state_dict(checkpoint['scheduler_state_dict'])
         
-        start_epoch = checkpoint['epoch'] + 1  # Next epoch to train
+        # The checkpoint contains the COMPLETED epoch, so we start from the next one
+        start_epoch = checkpoint['epoch'] + 1
         train_losses = checkpoint.get('train_losses', [])
         val_losses = checkpoint.get('val_losses', [])
         train_accs = checkpoint.get('train_accs', [])
         val_accs = checkpoint.get('val_accs', [])
         
-        print(f'✓ Resumed from epoch {checkpoint["epoch"]}')
+        print(f'✓ Resumed from epoch {checkpoint["epoch"]} (completed)')
+        print(f'  Will start training from epoch {start_epoch}')
         if train_accs:
             print(f'  Last train acc: {train_accs[-1]:.2f}%')
             print(f'  Last val acc: {val_accs[-1]:.2f}%')
@@ -235,7 +245,10 @@ def main(args):
     injections_hdf = os.path.join(args.data_dir, f'dataset-{dataset}/v2/train_injections_s24w61w_1.hdf')
     inj_npy = os.path.join(args.data_dir, f'dataset-{dataset}/v2/train_injections_s24w61w_1.25s_all.npy')
 
+    # Decode the SNR schedule once
     sch_epochs, sch_ranges = decode_snr_schedule(args.snr_schedule)
+    
+    # Initialize with first SNR range
     min_snr, max_snr = sch_ranges[0]
     training_dataset = SlicerDatasetSNR(background_hdf, inj_npy, slice_len=int(args.slice_dur * sample_rate),
                                         slice_stride=int(args.slice_stride * sample_rate),
@@ -265,16 +278,21 @@ def main(args):
     val_accs = []
     
     if args.resume_from is not None:
-        # This now loads optimizer and scheduler state too!
         start_epoch, train_losses, val_losses, train_accs, val_accs = load_checkpoint(
             args.resume_from, net, opt, sch, train_device
         )
-        # Note: No need to manually advance scheduler, it's loaded from checkpoint!
+        print(f"\n{'='*60}")
+        print(f"RESUMING TRAINING FROM EPOCH {start_epoch}")
+        print(f"{'='*60}\n")
 
     n_epochs = args.epochs
     
     # train/val loop - starts from start_epoch
     for epoch in range(start_epoch, n_epochs):
+        
+        print(f"\n{'='*60}")
+        print(f"STARTING EPOCH {epoch} (out of {n_epochs})")
+        print(f"{'='*60}")
 
         net.train()
         # train losses
@@ -287,9 +305,11 @@ def main(args):
         total_val = 0
         correct_val = 0
 
-        # Use the actual epoch number for SNR schedule
+        # *** FIX: Use the actual epoch number for SNR schedule ***
+        # This will correctly progress through the schedule even after resuming
         s_min, s_max = get_snr_by_epoch(sch_epochs, sch_ranges, epoch)
         training_dataset.set_snr_range(s_min, s_max)
+        print(f"SNR range for epoch {epoch}: [{s_min}, {s_max}]")
 
         for idx, (training_samples, training_labels, training_inj_times) in enumerate(train_dl):
             training_samples = training_samples.to(device=train_device)
@@ -378,7 +398,8 @@ def main(args):
         val_accs.append(val_acc)
         logging.info(output_string)
         
-        # *** SAVE COMPLETE CHECKPOINT (with optimizer!) ***
+        # *** SAVE CHECKPOINT BEFORE SCHEDULER STEP ***
+        # This ensures the checkpoint has the correct scheduler state for resuming
         save_checkpoint(
             epoch=epoch,
             net=net,
@@ -392,8 +413,10 @@ def main(args):
             args=args
         )
         
-        # Step scheduler AFTER saving (so checkpoint has correct state)
+        # *** STEP SCHEDULER AFTER SAVING ***
+        # This updates the learning rate for the next epoch
         sch.step()
+        print(f"Learning rate after epoch {epoch}: {opt.param_groups[0]['lr']:.2e}")
         
         # Also save legacy JSON stats for compatibility
         with open(os.path.join(output_dir, f'training_stats_{epoch + 1}.json'), 'w') as f:
